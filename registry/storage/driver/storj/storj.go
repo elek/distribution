@@ -46,9 +46,9 @@ func (factory *storjDriverFactory) Create(parameters map[string]interface{}) (st
 }
 
 type driver struct {
-	AccessGrant *uplink.Access
-	Project     *uplink.Project
-	Bucket      string
+	accessGrant *uplink.Access
+	project     *uplink.Project
+	bucket      string
 }
 
 type baseEmbed struct {
@@ -91,9 +91,7 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 	return New(params)
 }
 
-// getParameterAs
-// New constructs a new Driver with the given AWS credentials, region, encryption flag, and
-// bucketName
+// New constructs a new Driver with the given Access Grant and bucketName.
 func New(params DriverParameters) (*Driver, error) {
 	accessGrant, err := uplink.ParseAccess(params.AccessGrant)
 	if err != nil {
@@ -107,9 +105,9 @@ func New(params DriverParameters) (*Driver, error) {
 	}
 
 	d := &driver{
-		AccessGrant: accessGrant,
-		Project:     project,
-		Bucket:      params.Bucket,
+		accessGrant: accessGrant,
+		project:     project,
+		bucket:      params.Bucket,
 	}
 
 	return &Driver{
@@ -121,6 +119,10 @@ func New(params DriverParameters) (*Driver, error) {
 	}, nil
 }
 
+func storjKey(path string) string {
+	return strings.TrimLeft(path, "/")
+}
+
 // Implement the storagedriver.StorageDriver interface
 func (d *driver) Name() string {
 	return driverName
@@ -128,39 +130,25 @@ func (d *driver) Name() string {
 
 // GetContent retrieves the content stored at "path" as a []byte.
 func (d *driver) GetContent(ctx context.Context, path string) (_ []byte, err error) {
-	fmt.Println("GetContent", path)
-	download, err := d.Project.DownloadObject(ctx, d.Bucket, storjPath(path), nil)
+	download, err := d.project.DownloadObject(ctx, d.bucket, storjKey(path), nil)
 	if err != nil {
-		if errors.Is(err, uplink.ErrObjectNotFound) {
-			return nil, storagedriver.PathNotFoundError{
-				DriverName: driverName,
-				Path:       path,
-			}
-		}
-		return nil, err
+		return nil, convertError(path, err)
 	}
 
 	defer func() {
-		download.Close()
+		_ = download.Close()
 	}()
 
 	data, err := ioutil.ReadAll(download)
 	if err != nil {
-		if errors.Is(err, uplink.ErrObjectNotFound) {
-			return nil, storagedriver.PathNotFoundError{
-				DriverName: driverName,
-				Path:       path,
-			}
-		}
-		return nil, err
+		return nil, convertError(path, err)
 	}
 	return data, nil
 }
 
 // PutContent stores the []byte content at a location designated by "path".
 func (d *driver) PutContent(ctx context.Context, path string, contents []byte) error {
-	fmt.Println("PutContent", path)
-	upload, err := d.Project.UploadObject(ctx, d.Bucket, storjPath(path), nil)
+	upload, err := d.project.UploadObject(ctx, d.bucket, storjKey(path), nil)
 	if err != nil {
 		return err
 	}
@@ -183,54 +171,50 @@ func (d *driver) PutContent(ctx context.Context, path string, contents []byte) e
 // Reader retrieves an io.ReadCloser for the content stored at "path" with a
 // given byte offset.
 func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.ReadCloser, error) {
-	fmt.Println("Reader", path)
-
-	download, err := d.Project.DownloadObject(ctx, d.Bucket, storjPath(path), &uplink.DownloadOptions{
+	download, err := d.project.DownloadObject(ctx, d.bucket, storjKey(path), &uplink.DownloadOptions{
 		Offset: offset,
 		Length: -1,
 	})
 	if err != nil {
-		if errors.Is(err, uplink.ErrObjectNotFound) {
-			return nil, storagedriver.PathNotFoundError{
-				DriverName: driverName,
-				Path:       path,
-			}
-		}
-		return nil, err
+		return nil, convertError(path, err)
 	}
 
 	return download, nil
 }
 
-func storjPath(path string) string {
-	return strings.TrimLeft(path, "/")
-}
-
 // Writer returns a FileWriter which will store the content written to it
 // at the location designated by "path" after the call to Commit.
 func (d *driver) Writer(ctx context.Context, path string, appendParam bool) (storagedriver.FileWriter, error) {
-	fmt.Println("Writer", path)
+	key := storjKey(path)
 
-	key := storjPath(path)
+	// TODO verify that parts are not too small
 
 	var uploadID string
-	partNumber := uint32(0)
+	partNumber := uint32(1)
 	var size int64
-	if appendParam {
-		uploads := d.Project.ListUploads(ctx, d.Bucket, &uplink.ListUploadsOptions{
+	if !appendParam {
+		upload, err := d.project.BeginUpload(ctx, d.bucket, key, nil)
+		if err != nil {
+			return nil, err
+		}
+		uploadID = upload.UploadID
+	} else {
+		uploads := d.project.ListUploads(ctx, d.bucket, &uplink.ListUploadsOptions{
 			Prefix: key,
 		})
 
+		// currently we should get only single upload
 		for uploads.Next() {
 			item := uploads.Item()
 			uploadID = item.UploadID
+
+			continue
 		}
 		if err := uploads.Err(); err != nil {
 			return nil, err
 		}
 
-		// TODO list all parts
-		parts := d.Project.ListUploadParts(ctx, d.Bucket, key, uploadID, nil)
+		parts := d.project.ListUploadParts(ctx, d.bucket, key, uploadID, nil)
 		for parts.Next() {
 			item := parts.Item()
 			partNumber = item.PartNumber
@@ -241,47 +225,54 @@ func (d *driver) Writer(ctx context.Context, path string, appendParam bool) (sto
 		}
 
 		partNumber++
-	} else {
-		upload, err := d.Project.BeginUpload(ctx, d.Bucket, key, nil)
-		if err != nil {
-			return nil, err
-		}
-		uploadID = upload.UploadID
 	}
 
-	uploadPart, err := d.Project.UploadPart(ctx, d.Bucket, key, uploadID, uint32(partNumber))
+	uploadPart, err := d.project.UploadPart(ctx, d.bucket, key, uploadID, uint32(partNumber))
 	if err != nil {
-		return nil, err
+		return nil, convertError(path, err)
 	}
 
-	return d.newWriter(ctx, d.Project, d.Bucket, key, uploadID, size, uploadPart), nil
+	return d.newWriter(ctx, d.project, d.bucket, key, uploadID, size, uploadPart), nil
 }
 
 // Stat retrieves the FileInfo for the given path, including the current size
 // in bytes and the creation time.
 func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
-	fmt.Println("Stat", path)
 	if path == "/" {
 		return storagedriver.FileInfoInternal{FileInfoFields: storagedriver.FileInfoFields{
 			Path:  path,
 			IsDir: true,
 		}}, nil
 	}
-	// TODO we need to return stat for dirs
-	object, err := d.Project.StatObject(ctx, d.Bucket, storjPath(path))
-	if err != nil {
-		if errors.Is(err, uplink.ErrObjectNotFound) {
-			return nil, storagedriver.PathNotFoundError{
-				DriverName: driverName,
-				Path:       path,
-			}
-		}
 
+	// TODO we should be able to stat dir or object with single list object
+	// we need to parse from path to get one level less dir and use cursor
+	// for listing. Cursor should be calculated as key before last path entry.
+
+	iterator := d.project.ListObjects(ctx, d.bucket, &uplink.ListObjectsOptions{
+		Prefix: storjKey(path) + "/",
+	})
+
+	// it prefix has at least one entry its a dir
+	found := iterator.Next()
+	if err := iterator.Err(); err != nil {
 		return nil, err
 	}
 
+	if found {
+		return storagedriver.FileInfoInternal{FileInfoFields: storagedriver.FileInfoFields{
+			Path:  path,
+			IsDir: true,
+		}}, nil
+	}
+
+	object, err := d.project.StatObject(ctx, d.bucket, storjKey(path))
+	if err != nil {
+		return nil, convertError(path, err)
+	}
+
 	fi := storagedriver.FileInfoFields{
-		Path:    "/" + object.Key,
+		Path:    path,
 		Size:    object.System.ContentLength,
 		ModTime: object.System.Created,
 		IsDir:   object.IsPrefix,
@@ -292,22 +283,21 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 
 // List returns a list of the objects that are direct descendants of the given path.
 func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
-	fmt.Println("List", opath)
-	path := opath
-	if path != "/" && path[len(path)-1] != '/' {
-		path = path + "/"
+	prefix := opath
+	if prefix != "/" && prefix[len(prefix)-1] != '/' {
+		prefix = prefix + "/"
 	}
 
 	// This is to cover for the cases when the rootDirectory of the driver is either "" or "/".
 	// In those cases, there is no root prefix to replace and we must actually add a "/" to all
 	// results in order to keep them as valid paths as recognized by storagedriver.PathRegexp
 	// prefix := ""
-	// if storjPath("") == "" {
+	// if storjKey("") == "" {
 	// 	prefix = "/"
 	// }
 
-	iterator := d.Project.ListObjects(ctx, d.Bucket, &uplink.ListObjectsOptions{
-		Prefix: storjPath(path),
+	iterator := d.project.ListObjects(ctx, d.bucket, &uplink.ListObjectsOptions{
+		Prefix: storjKey(prefix),
 	})
 
 	found := false
@@ -336,7 +326,7 @@ func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
 func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) error {
 	// TODO maybe we should stat first and if exists delete second
 	for {
-		err := d.Project.MoveObject(ctx, d.Bucket, storjPath(sourcePath), d.Bucket, storjPath(destPath), nil)
+		err := d.project.MoveObject(ctx, d.bucket, storjKey(sourcePath), d.bucket, storjKey(destPath), nil)
 		if err != nil {
 			if errors.Is(err, uplink.ErrObjectNotFound) {
 				return storagedriver.PathNotFoundError{
@@ -344,7 +334,7 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 					Path:       sourcePath,
 				}
 			} else if strings.Contains(err.Error(), "object already exists") { // TODO have this error in uplink
-				_, err := d.Project.DeleteObject(ctx, d.Bucket, storjPath(destPath))
+				_, err := d.project.DeleteObject(ctx, d.bucket, storjKey(destPath))
 				if err != nil {
 					return err
 				}
@@ -359,9 +349,8 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 // Delete recursively deletes all objects stored at "path" and its subpaths.
 // We must be careful since S3 does not guarantee read after delete consistency
 func (d *driver) Delete(ctx context.Context, path string) error {
-	fmt.Println("Delete", path)
-	iterator := d.Project.ListObjects(ctx, d.Bucket, &uplink.ListObjectsOptions{
-		Prefix:    storjPath(path) + "/",
+	iterator := d.project.ListObjects(ctx, d.bucket, &uplink.ListObjectsOptions{
+		Prefix:    storjKey(path) + "/",
 		Recursive: true,
 	})
 
@@ -369,7 +358,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 	for iterator.Next() {
 		found = true
 		item := iterator.Item()
-		_, err := d.Project.DeleteObject(ctx, d.Bucket, item.Key)
+		_, err := d.project.DeleteObject(ctx, d.bucket, item.Key)
 		if err != nil {
 			return err
 		}
@@ -382,7 +371,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 		return nil
 	}
 
-	object, err := d.Project.DeleteObject(ctx, d.Bucket, storjPath(path))
+	object, err := d.project.DeleteObject(ctx, d.bucket, storjKey(path))
 	if err != nil {
 		return err
 	}
@@ -406,9 +395,10 @@ func (d *driver) URLFor(ctx context.Context, path string, options map[string]int
 // Walk traverses a filesystem defined within driver, starting
 // from the given path, calling f on each file
 func (d *driver) Walk(ctx context.Context, from string, f storagedriver.WalkFn) error {
-	fmt.Println("Walk", from)
 	return nil
 }
+
+// TODO should we buffer data written to 'writer'?
 
 type writer struct {
 	ctx     context.Context
@@ -458,10 +448,12 @@ func (w *writer) Write(p []byte) (int, error) {
 	return n, nil
 }
 
+// Size returns the number of bytes written to this FileWriter.
 func (w *writer) Size() int64 {
 	return w.size
 }
 
+// Cancel removes any written content from this FileWriter.
 func (w *writer) Cancel() error {
 	if w.closed {
 		return fmt.Errorf("already closed")
@@ -476,6 +468,9 @@ func (w *writer) Cancel() error {
 	return w.project.AbortUpload(w.ctx, w.bucket, w.key, w.uploadID)
 }
 
+// Commit flushes all content written to this FileWriter and makes it
+// available for future calls to StorageDriver.GetContent and
+// StorageDriver.Reader.
 func (w *writer) Commit() error {
 	if w.closed {
 		return fmt.Errorf("already closed")
@@ -505,11 +500,23 @@ func (w *writer) Close() error {
 }
 
 func (w *writer) CommitPart() error {
-	if w.partSize > 0 {
-		err := w.upload.Commit()
-		if err != nil && !errors.Is(err, uplink.ErrUploadDone) {
-			return err
-		}
+	if w.partSize <= 0 {
+		return nil
+	}
+
+	err := w.upload.Commit()
+	if err != nil && !errors.Is(err, uplink.ErrUploadDone) {
+		return err
 	}
 	return nil
+}
+
+func convertError(path string, err error) error {
+	if errors.Is(err, uplink.ErrObjectNotFound) {
+		return storagedriver.PathNotFoundError{
+			DriverName: driverName,
+			Path:       path,
+		}
+	}
+	return err
 }
