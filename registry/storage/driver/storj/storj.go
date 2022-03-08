@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"os"
 	"strings"
 
 	"storj.io/uplink"
@@ -66,11 +67,18 @@ type Driver struct {
 // - bucket
 func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 	accessGrant := parameters["accessgrant"]
+	if os.Getenv("UPLINK_ACCESS") != "" {
+		accessGrant = os.Getenv("UPLINK_ACCESS")
+	}
+
 	if accessGrant == nil {
 		return nil, fmt.Errorf("no accessgrant parameter provided")
 	}
 
 	bucket := parameters["bucket"]
+	if os.Getenv("UPLINK_BUCKET") != "" {
+		bucket = os.Getenv("UPLINK_BUCKET")
+	}
 	if bucket == nil || fmt.Sprint(bucket) == "" {
 		return nil, fmt.Errorf("no bucket parameter provided")
 	}
