@@ -1,15 +1,6 @@
-// Package s3 provides a storagedriver.StorageDriver implementation to
-// store blobs in Amazon S3 cloud storage.
-//
-// This package leverages the official aws client library for interfacing with
-// S3.
-//
-// Because S3 is a key, value store the Stat call does not support last modification
-// time for directories (directories are an abstraction for key, value stores)
-//
-// Keep in mind that S3 guarantees only read-after-write consistency for new
-// objects, but no read-after-update or list-after-write consistency.
-package s3
+// Package storj provides a storagedriver.StorageDriver implementation to
+// store blobs in Storj DCS decentralized storage.
+package storj
 
 import (
 	"context"
@@ -25,10 +16,12 @@ import (
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/distribution/v3/registry/storage/driver/base"
 	"github.com/distribution/distribution/v3/registry/storage/driver/factory"
+	"github.com/zeebo/errs"
 )
 
 const driverName = "storj"
 
+//DriverParameters A struct that encapsulates all of the driver parameters after all values have been set.
 type DriverParameters struct {
 	AccessGrant string
 	Bucket      string
@@ -38,7 +31,7 @@ func init() {
 	factory.Register("storj", &storjDriverFactory{})
 }
 
-// storjDriverFactory implements the factory.StorageDriverFactory interface
+// storjDriverFactory implements the factory.StorageDriverFactory interface.
 type storjDriverFactory struct{}
 
 func (factory *storjDriverFactory) Create(parameters map[string]interface{}) (storagedriver.StorageDriver, error) {
@@ -46,16 +39,15 @@ func (factory *storjDriverFactory) Create(parameters map[string]interface{}) (st
 }
 
 type driver struct {
-	accessGrant *uplink.Access
-	project     *uplink.Project
-	bucket      string
+	project *uplink.Project
+	bucket  string
 }
 
 type baseEmbed struct {
 	base.Base
 }
 
-// Driver is a storagedriver.StorageDriver implementation backed by Amazon S3
+// Driver is a storagedriver.StorageDriver implementation backed by Storj DCS.
 // Objects are stored at absolute keys in the provided bucket.
 type Driver struct {
 	baseEmbed
@@ -98,16 +90,17 @@ func New(params DriverParameters) (*Driver, error) {
 		return nil, err
 	}
 
-	// TODO close it somehow
+	// TODO setup connection pooling
+	// TODO close project somehow
+	// TODO provide better context
 	project, err := uplink.OpenProject(context.TODO(), accessGrant)
 	if err != nil {
 		return nil, err
 	}
 
 	d := &driver{
-		accessGrant: accessGrant,
-		project:     project,
-		bucket:      params.Bucket,
+		project: project,
+		bucket:  params.Bucket,
 	}
 
 	return &Driver{
@@ -136,7 +129,7 @@ func (d *driver) GetContent(ctx context.Context, path string) (_ []byte, err err
 	}
 
 	defer func() {
-		_ = download.Close()
+		err = errs.Combine(err, download.Close())
 	}()
 
 	data, err := ioutil.ReadAll(download)
@@ -347,7 +340,6 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 }
 
 // Delete recursively deletes all objects stored at "path" and its subpaths.
-// We must be careful since S3 does not guarantee read after delete consistency
 func (d *driver) Delete(ctx context.Context, path string) error {
 	iterator := d.project.ListObjects(ctx, d.bucket, &uplink.ListObjectsOptions{
 		Prefix:    storjKey(path) + "/",
@@ -395,6 +387,54 @@ func (d *driver) URLFor(ctx context.Context, path string, options map[string]int
 // Walk traverses a filesystem defined within driver, starting
 // from the given path, calling f on each file
 func (d *driver) Walk(ctx context.Context, from string, f storagedriver.WalkFn) error {
+	prefix := storjKey(from)
+
+	if prefix != "" {
+		prefix += "/"
+	}
+
+	return d.doWalk(ctx, prefix, f)
+}
+
+func (d *driver) doWalk(ctx context.Context, prefix string, f storagedriver.WalkFn) error {
+	storjPrefix := storjKey(prefix)
+
+	// TODO could we do this with single recursive request?
+	objects := d.project.ListObjects(ctx, d.bucket, &uplink.ListObjectsOptions{
+		Prefix: storjPrefix,
+	})
+
+	for objects.Next() {
+		item := objects.Item()
+
+		path := "/" + item.Key
+		path = strings.TrimRight(path, "/")
+
+		fileInfo := storagedriver.FileInfoInternal{FileInfoFields: storagedriver.FileInfoFields{
+			Path:    path,
+			Size:    item.System.ContentLength,
+			ModTime: item.System.Created,
+			IsDir:   item.IsPrefix,
+		}}
+		err := f(fileInfo)
+		if err != nil {
+			if err == storagedriver.ErrSkipDir {
+				continue
+			}
+			return err
+		}
+
+		if item.IsPrefix {
+			err = d.doWalk(ctx, item.Key, f)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if err := objects.Err(); err != nil {
+		return err
+	}
+
 	return nil
 }
 

@@ -1,4 +1,4 @@
-package s3
+package storj
 
 import (
 	"os"
