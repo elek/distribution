@@ -6,9 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/distribution/distribution/v3/registry/auth/storj"
 	"io"
 	"io/ioutil"
-	"os"
 	"strings"
 
 	"storj.io/uplink"
@@ -35,12 +35,10 @@ func init() {
 type storjDriverFactory struct{}
 
 func (factory *storjDriverFactory) Create(parameters map[string]interface{}) (storagedriver.StorageDriver, error) {
-	return FromParameters(parameters)
+	return New()
 }
 
 type driver struct {
-	project *uplink.Project
-	bucket  string
 }
 
 type baseEmbed struct {
@@ -53,55 +51,10 @@ type Driver struct {
 	baseEmbed
 }
 
-// FromParameters constructs a new Driver with a given parameters map
-// Required parameters:
-// - accessgrant
-// - bucket
-func FromParameters(parameters map[string]interface{}) (*Driver, error) {
-	accessGrant := parameters["accessgrant"]
-	if os.Getenv("UPLINK_ACCESS") != "" {
-		accessGrant = os.Getenv("UPLINK_ACCESS")
-	}
-
-	if accessGrant == nil {
-		return nil, fmt.Errorf("no accessgrant parameter provided")
-	}
-
-	bucket := parameters["bucket"]
-	if os.Getenv("UPLINK_BUCKET") != "" {
-		bucket = os.Getenv("UPLINK_BUCKET")
-	}
-	if bucket == nil || fmt.Sprint(bucket) == "" {
-		return nil, fmt.Errorf("no bucket parameter provided")
-	}
-
-	params := DriverParameters{
-		fmt.Sprint(accessGrant),
-		fmt.Sprint(bucket),
-	}
-
-	return New(params)
-}
-
 // New constructs a new Driver with the given Access Grant and bucketName.
-func New(params DriverParameters) (*Driver, error) {
-	accessGrant, err := uplink.ParseAccess(params.AccessGrant)
-	if err != nil {
-		return nil, err
-	}
+func New() (*Driver, error) {
 
-	// TODO setup connection pooling
-	// TODO close project somehow
-	// TODO provide better context
-	project, err := uplink.OpenProject(context.TODO(), accessGrant)
-	if err != nil {
-		return nil, err
-	}
-
-	d := &driver{
-		project: project,
-		bucket:  params.Bucket,
-	}
+	d := &driver{}
 
 	return &Driver{
 		baseEmbed: baseEmbed{
@@ -121,9 +74,30 @@ func (d *driver) Name() string {
 	return driverName
 }
 
+func (d *driver) openProjectWithBucket(ctx context.Context) (*uplink.Project, string, error) {
+	access := storj.GetGrant(ctx)
+	accessGrant, err := uplink.ParseAccess(access)
+	if err != nil {
+		return nil, "", err
+	}
+
+	project, err := uplink.OpenProject(ctx, accessGrant)
+	if err != nil {
+		return nil, "", err
+	}
+	return project, "registry2", err
+
+}
+
 // GetContent retrieves the content stored at "path" as a []byte.
 func (d *driver) GetContent(ctx context.Context, path string) (_ []byte, err error) {
-	download, err := d.project.DownloadObject(ctx, d.bucket, storjKey(path), nil)
+	project, bucket, err := d.openProjectWithBucket(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer project.Close()
+
+	download, err := project.DownloadObject(ctx, bucket, storjKey(path), nil)
 	if err != nil {
 		return nil, convertError(path, err)
 	}
@@ -141,7 +115,13 @@ func (d *driver) GetContent(ctx context.Context, path string) (_ []byte, err err
 
 // PutContent stores the []byte content at a location designated by "path".
 func (d *driver) PutContent(ctx context.Context, path string, contents []byte) error {
-	upload, err := d.project.UploadObject(ctx, d.bucket, storjKey(path), nil)
+	project, bucket, err := d.openProjectWithBucket(ctx)
+	if err != nil {
+		return err
+	}
+	defer project.Close()
+
+	upload, err := project.UploadObject(ctx, bucket, storjKey(path), nil)
 	if err != nil {
 		return err
 	}
@@ -164,7 +144,13 @@ func (d *driver) PutContent(ctx context.Context, path string, contents []byte) e
 // Reader retrieves an io.ReadCloser for the content stored at "path" with a
 // given byte offset.
 func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.ReadCloser, error) {
-	download, err := d.project.DownloadObject(ctx, d.bucket, storjKey(path), &uplink.DownloadOptions{
+	project, bucket, err := d.openProjectWithBucket(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer project.Close()
+
+	download, err := project.DownloadObject(ctx, bucket, storjKey(path), &uplink.DownloadOptions{
 		Offset: offset,
 		Length: -1,
 	})
@@ -178,6 +164,12 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 // Writer returns a FileWriter which will store the content written to it
 // at the location designated by "path" after the call to Commit.
 func (d *driver) Writer(ctx context.Context, path string, appendParam bool) (storagedriver.FileWriter, error) {
+	project, bucket, err := d.openProjectWithBucket(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer project.Close()
+
 	key := storjKey(path)
 
 	// TODO verify that parts are not too small
@@ -186,13 +178,13 @@ func (d *driver) Writer(ctx context.Context, path string, appendParam bool) (sto
 	partNumber := uint32(1)
 	var size int64
 	if !appendParam {
-		upload, err := d.project.BeginUpload(ctx, d.bucket, key, nil)
+		upload, err := project.BeginUpload(ctx, bucket, key, nil)
 		if err != nil {
 			return nil, err
 		}
 		uploadID = upload.UploadID
 	} else {
-		uploads := d.project.ListUploads(ctx, d.bucket, &uplink.ListUploadsOptions{
+		uploads := project.ListUploads(ctx, bucket, &uplink.ListUploadsOptions{
 			Prefix: key,
 		})
 
@@ -207,7 +199,7 @@ func (d *driver) Writer(ctx context.Context, path string, appendParam bool) (sto
 			return nil, err
 		}
 
-		parts := d.project.ListUploadParts(ctx, d.bucket, key, uploadID, nil)
+		parts := project.ListUploadParts(ctx, bucket, key, uploadID, nil)
 		for parts.Next() {
 			item := parts.Item()
 			partNumber = item.PartNumber
@@ -220,17 +212,24 @@ func (d *driver) Writer(ctx context.Context, path string, appendParam bool) (sto
 		partNumber++
 	}
 
-	uploadPart, err := d.project.UploadPart(ctx, d.bucket, key, uploadID, uint32(partNumber))
+	uploadPart, err := project.UploadPart(ctx, bucket, key, uploadID, uint32(partNumber))
 	if err != nil {
 		return nil, convertError(path, err)
 	}
 
-	return d.newWriter(ctx, d.project, d.bucket, key, uploadID, size, uploadPart), nil
+	return d.newWriter(ctx, project, bucket, key, uploadID, size, uploadPart), nil
 }
 
 // Stat retrieves the FileInfo for the given path, including the current size
 // in bytes and the creation time.
 func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
+	project, bucket, err := d.openProjectWithBucket(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	defer project.Close()
+
 	if path == "/" {
 		return storagedriver.FileInfoInternal{FileInfoFields: storagedriver.FileInfoFields{
 			Path:  path,
@@ -242,7 +241,7 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 	// we need to parse from path to get one level less dir and use cursor
 	// for listing. Cursor should be calculated as key before last path entry.
 
-	iterator := d.project.ListObjects(ctx, d.bucket, &uplink.ListObjectsOptions{
+	iterator := project.ListObjects(ctx, bucket, &uplink.ListObjectsOptions{
 		Prefix: storjKey(path) + "/",
 	})
 
@@ -259,7 +258,7 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 		}}, nil
 	}
 
-	object, err := d.project.StatObject(ctx, d.bucket, storjKey(path))
+	object, err := project.StatObject(ctx, bucket, storjKey(path))
 	if err != nil {
 		return nil, convertError(path, err)
 	}
@@ -276,6 +275,12 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 
 // List returns a list of the objects that are direct descendants of the given path.
 func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
+	project, bucket, err := d.openProjectWithBucket(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer project.Close()
+
 	prefix := opath
 	if prefix != "/" && prefix[len(prefix)-1] != '/' {
 		prefix = prefix + "/"
@@ -289,7 +294,7 @@ func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
 	// 	prefix = "/"
 	// }
 
-	iterator := d.project.ListObjects(ctx, d.bucket, &uplink.ListObjectsOptions{
+	iterator := project.ListObjects(ctx, bucket, &uplink.ListObjectsOptions{
 		Prefix: storjKey(prefix),
 	})
 
@@ -317,9 +322,15 @@ func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
 // Move moves an object stored at sourcePath to destPath, removing the original
 // object.
 func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) error {
+	project, bucket, err := d.openProjectWithBucket(ctx)
+	if err != nil {
+		return err
+	}
+	defer project.Close()
+
 	// TODO maybe we should stat first and if exists delete second
 	for {
-		err := d.project.MoveObject(ctx, d.bucket, storjKey(sourcePath), d.bucket, storjKey(destPath), nil)
+		err := project.MoveObject(ctx, bucket, storjKey(sourcePath), bucket, storjKey(destPath), nil)
 		if err != nil {
 			if errors.Is(err, uplink.ErrObjectNotFound) {
 				return storagedriver.PathNotFoundError{
@@ -327,7 +338,7 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 					Path:       sourcePath,
 				}
 			} else if strings.Contains(err.Error(), "object already exists") { // TODO have this error in uplink
-				_, err := d.project.DeleteObject(ctx, d.bucket, storjKey(destPath))
+				_, err := project.DeleteObject(ctx, bucket, storjKey(destPath))
 				if err != nil {
 					return err
 				}
@@ -341,7 +352,13 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 
 // Delete recursively deletes all objects stored at "path" and its subpaths.
 func (d *driver) Delete(ctx context.Context, path string) error {
-	iterator := d.project.ListObjects(ctx, d.bucket, &uplink.ListObjectsOptions{
+	project, bucket, err := d.openProjectWithBucket(ctx)
+	if err != nil {
+		return err
+	}
+	defer project.Close()
+
+	iterator := project.ListObjects(ctx, bucket, &uplink.ListObjectsOptions{
 		Prefix:    storjKey(path) + "/",
 		Recursive: true,
 	})
@@ -350,7 +367,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 	for iterator.Next() {
 		found = true
 		item := iterator.Item()
-		_, err := d.project.DeleteObject(ctx, d.bucket, item.Key)
+		_, err := project.DeleteObject(ctx, bucket, item.Key)
 		if err != nil {
 			return err
 		}
@@ -363,7 +380,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 		return nil
 	}
 
-	object, err := d.project.DeleteObject(ctx, d.bucket, storjKey(path))
+	object, err := project.DeleteObject(ctx, bucket, storjKey(path))
 	if err != nil {
 		return err
 	}
@@ -397,10 +414,16 @@ func (d *driver) Walk(ctx context.Context, from string, f storagedriver.WalkFn) 
 }
 
 func (d *driver) doWalk(ctx context.Context, prefix string, f storagedriver.WalkFn) error {
+	project, bucket, err := d.openProjectWithBucket(ctx)
+	if err != nil {
+		return err
+	}
+	defer project.Close()
+
 	storjPrefix := storjKey(prefix)
 
 	// TODO could we do this with single recursive request?
-	objects := d.project.ListObjects(ctx, d.bucket, &uplink.ListObjectsOptions{
+	objects := project.ListObjects(ctx, bucket, &uplink.ListObjectsOptions{
 		Prefix: storjPrefix,
 	})
 

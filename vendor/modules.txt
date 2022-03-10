@@ -21,8 +21,6 @@ github.com/Azure/go-autorest/tracing
 # github.com/Shopify/logrus-bugsnag v0.0.0-20171204204709-577dee27f20d
 ## explicit
 github.com/Shopify/logrus-bugsnag
-# github.com/armon/consul-api v0.0.0-20180202201655-eb2c6b5be1b6
-## explicit
 # github.com/aws/aws-sdk-go v1.42.27
 ## explicit
 github.com/aws/aws-sdk-go/aws
@@ -116,7 +114,6 @@ github.com/docker/libtrust
 # github.com/felixge/httpsnoop v1.0.1
 github.com/felixge/httpsnoop
 # github.com/gofrs/uuid v4.0.0+incompatible
-## explicit
 github.com/gofrs/uuid
 # github.com/gogo/protobuf v1.3.2
 github.com/gogo/protobuf/jsonpb
@@ -191,12 +188,8 @@ github.com/spacemonkeygo/monkit/v3/monotime
 github.com/spf13/cobra
 # github.com/spf13/pflag v1.0.5
 github.com/spf13/pflag
-# github.com/ugorji/go v1.1.4
-## explicit
 # github.com/vivint/infectious v0.0.0-20200605153912-25a574ae18a3
 github.com/vivint/infectious
-# github.com/xordataexchange/crypt v0.0.3-0.20170626215501-b2862e3d0a77
-## explicit
 # github.com/yvasiyarov/go-metrics v0.0.0-20140926110328-57bccd1ccd43
 ## explicit
 github.com/yvasiyarov/go-metrics
@@ -207,6 +200,7 @@ github.com/yvasiyarov/gorelic
 ## explicit
 github.com/yvasiyarov/newrelic_platform_go
 # github.com/zeebo/errs v1.2.2
+## explicit
 github.com/zeebo/errs
 # golang.org/x/crypto v0.0.0-20220131195533-30dcbda58838
 ## explicit
@@ -226,8 +220,6 @@ golang.org/x/crypto/pkcs12/internal/rc2
 golang.org/x/crypto/salsa20/salsa
 # golang.org/x/net v0.0.0-20211216030914-fe4d6282115f
 golang.org/x/net/idna
-# golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d
-## explicit
 # golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
 golang.org/x/sync/errgroup
 golang.org/x/sync/semaphore
@@ -241,10 +233,6 @@ golang.org/x/text/secure/bidirule
 golang.org/x/text/transform
 golang.org/x/text/unicode/bidi
 golang.org/x/text/unicode/norm
-# google.golang.org/api v0.20.0
-## explicit
-# google.golang.org/cloud v0.0.0-20151119220103-975617b05ea8
-## explicit
 # google.golang.org/protobuf v1.27.1
 google.golang.org/protobuf/encoding/prototext
 google.golang.org/protobuf/encoding/protowire
